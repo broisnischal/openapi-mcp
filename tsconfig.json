@@ -9,7 +9,7 @@
     "jsxImportSource": "hono/jsx",
     "outDir": "./dist",
     "rootDir": "./src",
-    "types": ["bun", "node"]
+    "types": ["node"]
   },
   "exclude": ["node_modules"]
 }

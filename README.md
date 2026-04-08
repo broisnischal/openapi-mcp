@@ -1,4 +1,4 @@
-# OpenAPI MCP Server (Hono + Bun)
+# OpenAPI MCP Server (Hono + Node.js)
 
 This project exposes an MCP server over HTTP using Hono at `/mcp`.
 
@@ -10,18 +10,18 @@ It gives three tools:
 
 ## Requirements
 
-- Bun installed
+- Node.js 18+ installed
 
 ## Install
 
 ```sh
-bun install
+npm install
 ```
 
 ## Run
 
 ```sh
-bun run dev
+npm run dev
 ```
 
 Server endpoints:
@@ -62,7 +62,7 @@ You can set the spec URL in two ways:
 1. **Server default (recommended):** set `OPENAPI_SPEC_URL` before starting server.
 
 ```sh
-OPENAPI_SPEC_URL="https://your-api.com/openapi.json" bun run dev
+OPENAPI_SPEC_URL="https://your-api.com/openapi.json" npm run dev
 ```
 
 2. **Per request override:** pass `specUrl` in `api_search` or `api_execute` arguments.

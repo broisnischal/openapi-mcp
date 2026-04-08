@@ -1,4 +1,7 @@
 import { dirname, join } from "node:path";
+import { mkdir, access, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
@@ -68,29 +71,30 @@ type SpecRuntime = {
 };
 
 const DEFAULT_SPEC_URL = "https://ag.nischal-dahal.com.np/api-docs-json";
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 /** Default cache path when OPENAPI_SPEC_FILE is unset (project root openapi.json). */
-const DEFAULT_SPEC_CACHE_FILE = Bun.env.VERCEL
+const DEFAULT_SPEC_CACHE_FILE = process.env.VERCEL
   ? "/tmp/openapi.json"
-  : join(import.meta.dir, "..", "openapi.json");
-const OPENAPI_CACHE_DIR = Bun.env.VERCEL
+  : join(PROJECT_ROOT, "openapi.json");
+const OPENAPI_CACHE_DIR = process.env.VERCEL
   ? "/tmp/openapi-cache"
-  : join(import.meta.dir, "..", ".openapi-cache");
-const API_BASE_URL = Bun.env.API_BASE_URL;
+  : join(PROJECT_ROOT, ".openapi-cache");
+const API_BASE_URL = process.env.API_BASE_URL;
 const DEFAULT_SESSION_ID = "default";
 
 function getExplicitOpenApiSpecUrl(): string | undefined {
-  const raw = Bun.env.OPENAPI_SPEC_URL;
+  const raw = process.env.OPENAPI_SPEC_URL;
   return raw && raw.trim().length > 0 ? raw.trim() : undefined;
 }
 
 /** Where to persist the fetched spec (env overrides default cache path). */
 function resolveOpenApiSpecFilePath(): string {
-  const raw = Bun.env.OPENAPI_SPEC_FILE?.trim();
+  const raw = process.env.OPENAPI_SPEC_FILE?.trim();
   return raw && raw.length > 0 ? raw : DEFAULT_SPEC_CACHE_FILE;
 }
 
 function isOpenApiOfflineMode(): boolean {
-  const v = Bun.env.OPENAPI_SPEC_OFFLINE?.trim().toLowerCase();
+  const v = process.env.OPENAPI_SPEC_OFFLINE?.trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes";
 }
 
@@ -108,12 +112,21 @@ function normalizeSpecUrl(value: unknown): string | undefined {
 }
 
 async function ensureParentDirectory(filePath: string): Promise<void> {
-  await Bun.$`mkdir -p ${dirname(filePath)}`;
+  await mkdir(dirname(filePath), { recursive: true });
 }
 
 function cacheFileForSpecUrl(specUrl: string): string {
-  const hash = Bun.hash(specUrl).toString(16);
+  const hash = createHash("sha256").update(specUrl).digest("hex");
   return join(OPENAPI_CACHE_DIR, `${hash}.openapi.json`);
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Short tool names stay under MCP client limits (server name + tool name ≤ ~60). */
@@ -251,13 +264,12 @@ async function loadOpenApiSpec(): Promise<OpenApiSpec> {
   const specUrl = getExplicitOpenApiSpecUrl() ?? DEFAULT_SPEC_URL;
 
   if (isOpenApiOfflineMode()) {
-    const file = Bun.file(specFile);
-    if (!(await file.exists())) {
+    if (!(await fileExists(specFile))) {
       throw new Error(
         `OPENAPI_SPEC_OFFLINE is set but spec file is missing: ${specFile}`,
       );
     }
-    return (await file.json()) as OpenApiSpec;
+    return JSON.parse(await readFile(specFile, "utf8")) as OpenApiSpec;
   }
 
   const specResponse = await fetch(specUrl, {
@@ -269,17 +281,17 @@ async function loadOpenApiSpec(): Promise<OpenApiSpec> {
 
   if (specResponse.ok) {
     const spec = (await specResponse.json()) as OpenApiSpec;
-    await Bun.write(specFile, JSON.stringify(spec, null, 2));
+    await ensureParentDirectory(specFile);
+    await writeFile(specFile, JSON.stringify(spec, null, 2), "utf8");
     console.error(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
     return spec;
   }
 
-  const file = Bun.file(specFile);
-  if (await file.exists()) {
+  if (await fileExists(specFile)) {
     console.error(
       `OpenAPI fetch failed (${specResponse.status} ${specResponse.statusText}); using cached ${specFile}`,
     );
-    return (await file.json()) as OpenApiSpec;
+    return JSON.parse(await readFile(specFile, "utf8")) as OpenApiSpec;
   }
 
   throw new Error(
@@ -302,15 +314,14 @@ async function loadSpecRuntime(
   if (specResponse.ok) {
     spec = (await specResponse.json()) as OpenApiSpec;
     await ensureParentDirectory(specFile);
-    await Bun.write(specFile, JSON.stringify(spec, null, 2));
+    await writeFile(specFile, JSON.stringify(spec, null, 2), "utf8");
     console.error(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
   } else {
-    const file = Bun.file(specFile);
-    if (await file.exists()) {
+    if (await fileExists(specFile)) {
       console.error(
         `OpenAPI fetch failed (${specResponse.status} ${specResponse.statusText}); using cached ${specFile}`,
       );
-      spec = (await file.json()) as OpenApiSpec;
+      spec = JSON.parse(await readFile(specFile, "utf8")) as OpenApiSpec;
     } else {
       throw new Error(
         `Failed to load OpenAPI spec: ${specResponse.status} ${specResponse.statusText}. No cache at ${specFile}.`,

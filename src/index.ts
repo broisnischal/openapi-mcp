@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { serve } from "@hono/node-server";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer } from "./mcp.js";
 
@@ -38,10 +39,7 @@ app.all("/mcp", async (c) => {
   return transport.handleRequest(c.req.raw);
 });
 
-const port = Number(Bun.env.PORT ?? 3000);
+const port = Number(process.env.PORT ?? 3000);
 console.log(`MCP server listening on http://localhost:${port}`);
 
-export default {
-  port,
-  fetch: app.fetch,
-};
+serve({ fetch: app.fetch, port });
