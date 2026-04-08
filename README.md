@@ -48,7 +48,7 @@ Add an MCP server entry that points to this URL:
 {
   "mcpServers": {
     "openapi-hono": {
-      "url": "https://dx.aitc.ai/mcp",
+      "url": "https://dx.lexicon.website/mcp",
       "env": {
         "OPENAPI_SPEC_URL": "https://ag.nischal-dahal.com.np/api-docs-json"
       }
