@@ -38,6 +38,8 @@ Server endpoints:
 - `API_BASE_URL`: override API base URL used for execution
 - `PORT`: HTTP server port (default `3000`)
 
+If the spec URL is temporarily unavailable (for example `502`), the MCP server now stays alive and returns a structured tool error with recovery hints instead of crashing.
+
 ## Use with an MCP client
 
 Add an MCP server entry that points to this URL:

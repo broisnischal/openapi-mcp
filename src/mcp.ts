@@ -594,8 +594,9 @@ async function runApiCall(
 }
 
 type SharedRuntimeState = {
-  defaultRuntime: SpecRuntime;
+  defaultRuntime?: SpecRuntime;
   runtimeCache: Map<string, SpecRuntime>;
+  initError?: string;
 };
 
 let sharedRuntimeStatePromise: Promise<SharedRuntimeState> | undefined;
@@ -603,33 +604,44 @@ let sharedRuntimeStatePromise: Promise<SharedRuntimeState> | undefined;
 async function getSharedRuntimeState(): Promise<SharedRuntimeState> {
   if (sharedRuntimeStatePromise) return sharedRuntimeStatePromise;
   sharedRuntimeStatePromise = (async () => {
-    const specUrlForOrigin = getExplicitOpenApiSpecUrl() ?? DEFAULT_SPEC_URL;
-    const specFile = resolveOpenApiSpecFilePath();
-    const defaultSpec = await loadOpenApiSpec();
-    const defaultOperations = collectOperations(defaultSpec);
-    const defaultMaps = buildOperationMaps(defaultOperations);
-    const defaultBaseUrl = (
-      API_BASE_URL ??
-      defaultSpec.servers?.[0]?.url ??
-      new URL(specUrlForOrigin).origin
-    ).replace(/\/$/, "");
-    const defaultRuntime: SpecRuntime = {
-      specUrl: specUrlForOrigin,
-      specFile,
-      baseUrl: defaultBaseUrl,
-      operations: defaultOperations,
-      byOperationId: defaultMaps.byOperationId,
-      byMethodPath: defaultMaps.byMethodPath,
-    };
     const runtimeCache = new Map<string, SpecRuntime>();
-    runtimeCache.set(defaultRuntime.specUrl, defaultRuntime);
-    return { defaultRuntime, runtimeCache };
+    try {
+      const specUrlForOrigin = getExplicitOpenApiSpecUrl() ?? DEFAULT_SPEC_URL;
+      const specFile = resolveOpenApiSpecFilePath();
+      const defaultSpec = await loadOpenApiSpec();
+      const defaultOperations = collectOperations(defaultSpec);
+      const defaultMaps = buildOperationMaps(defaultOperations);
+      const defaultBaseUrl = (
+        API_BASE_URL ??
+        defaultSpec.servers?.[0]?.url ??
+        new URL(specUrlForOrigin).origin
+      ).replace(/\/$/, "");
+      const defaultRuntime: SpecRuntime = {
+        specUrl: specUrlForOrigin,
+        specFile,
+        baseUrl: defaultBaseUrl,
+        operations: defaultOperations,
+        byOperationId: defaultMaps.byOperationId,
+        byMethodPath: defaultMaps.byMethodPath,
+      };
+      runtimeCache.set(defaultRuntime.specUrl, defaultRuntime);
+      return { defaultRuntime, runtimeCache };
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unknown startup error";
+      console.error(`OpenAPI startup load failed: ${message}`);
+      return {
+        runtimeCache,
+        initError: message,
+      };
+    }
   })();
   return sharedRuntimeStatePromise;
 }
 
 export async function createMcpServer(): Promise<Server> {
-  const { defaultRuntime, runtimeCache } = await getSharedRuntimeState();
+  const runtimeState = await getSharedRuntimeState();
+  const { runtimeCache } = runtimeState;
   const server = new Server(
     {
       name: "openapi-proxy-mcp",
@@ -655,46 +667,52 @@ export async function createMcpServer(): Promise<Server> {
       const session = getSession(sessionId ?? DEFAULT_SESSION_ID);
       const sessionSpecUrl = normalizeSpecUrl(session.variables.specUrl);
       const specUrl =
-        requestedSpecUrl ?? sessionSpecUrl ?? defaultRuntime.specUrl;
-      if (specUrl === defaultRuntime.specUrl) return defaultRuntime;
+        requestedSpecUrl ??
+        sessionSpecUrl ??
+        runtimeState.defaultRuntime?.specUrl ??
+        normalizeSpecUrl(getExplicitOpenApiSpecUrl()) ??
+        DEFAULT_SPEC_URL;
       const cached = runtimeCache.get(specUrl);
       if (cached) return cached;
       const runtime = await loadSpecRuntime(
         specUrl,
-        cacheFileForSpecUrl(specUrl),
+        specUrl === runtimeState.defaultRuntime?.specUrl
+          ? resolveOpenApiSpecFilePath()
+          : cacheFileForSpecUrl(specUrl),
       );
       runtimeCache.set(specUrl, runtime);
       return runtime;
     };
 
-    if (name === TOOL_SEARCH) {
-      const runtime = await runtimeFor(raw.sessionId as string | undefined);
-      const query = String(raw.query ?? "");
-      const limit = Math.min(100, Math.max(1, Number(raw.limit ?? 25) || 25));
-      const hits = searchOperations(runtime.operations, query, limit);
-      const payload = hits.map((op) => ({
-        operationId: op.operationId,
-        method: op.method,
-        path: op.path,
-        summary: op.summary ?? null,
-      }));
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                specUrl: runtime.specUrl,
-                count: payload.length,
-                operations: payload,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
-    }
+    try {
+      if (name === TOOL_SEARCH) {
+        const runtime = await runtimeFor(raw.sessionId as string | undefined);
+        const query = String(raw.query ?? "");
+        const limit = Math.min(100, Math.max(1, Number(raw.limit ?? 25) || 25));
+        const hits = searchOperations(runtime.operations, query, limit);
+        const payload = hits.map((op) => ({
+          operationId: op.operationId,
+          method: op.method,
+          path: op.path,
+          summary: op.summary ?? null,
+        }));
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  specUrl: runtime.specUrl,
+                  count: payload.length,
+                  operations: payload,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
 
     if (name === TOOL_SESSION) {
       const action = raw.action as string;
@@ -770,7 +788,7 @@ export async function createMcpServer(): Promise<Server> {
       };
     }
 
-    if (name === TOOL_EXECUTE) {
+      if (name === TOOL_EXECUTE) {
       const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
       const session = getSession(sessionId);
       const runtime = await runtimeFor(sessionId);
@@ -810,28 +828,50 @@ export async function createMcpServer(): Promise<Server> {
         extractVariables: raw.extractVariables as ToolInput["extractVariables"],
       };
 
-      const result = await runApiCall(op, toolArgs, session, runtime.baseUrl);
+        const result = await runApiCall(op, toolArgs, session, runtime.baseUrl);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ok: result.ok,
+                  status: result.status,
+                  operationId: result.operationId,
+                  method: result.method,
+                  path: result.path,
+                  url: result.url,
+                  specUrl: runtime.specUrl,
+                  data: result.data,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: result.isError,
+        };
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
       return {
+        isError: true,
         content: [
           {
             type: "text",
             text: JSON.stringify(
               {
-                ok: result.ok,
-                status: result.status,
-                operationId: result.operationId,
-                method: result.method,
-                path: result.path,
-                url: result.url,
-                specUrl: runtime.specUrl,
-                data: result.data,
+                ok: false,
+                error: message,
+                hint:
+                  "Set OPENAPI_SPEC_URL to a reachable JSON endpoint, or set OPENAPI_SPEC_OFFLINE=1 with OPENAPI_SPEC_FILE pointing to a local spec cache.",
+                startupError: runtimeState.initError ?? null,
               },
               null,
               2,
             ),
           },
         ],
-        isError: result.isError,
       };
     }
 
