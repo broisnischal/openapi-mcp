@@ -949,16 +949,14 @@ export async function createMcpServer(
     }
 
     const runtimeFor = async (sessionId?: string): Promise<SpecRuntime> => {
-      const session = getSession(sessionId ?? DEFAULT_SESSION_ID);
-      const sessionSpecUrl = normalizeSpecUrl(session.variables.specUrl);
+      getSession(sessionId ?? DEFAULT_SESSION_ID);
       const specUrl =
         requestedSpecUrl ??
-        sessionSpecUrl ??
         defaultSpecUrl ??
         normalizeSpecUrl(getExplicitOpenApiSpecUrl());
       if (!specUrl) {
         throw new Error(
-          "Missing OpenAPI URL. Provide `url` in the tool call, set session.variables.specUrl, or set OPENAPI_SPEC_URL.",
+          "Missing OpenAPI URL. Provide `url` in the tool call, set `?url=` on the MCP endpoint, send a `url` header, or set OPENAPI_SPEC_URL.",
         );
       }
       const cached = runtimeCache.get(specUrl);
@@ -975,11 +973,9 @@ export async function createMcpServer(
     try {
       if (name === TOOL_REFETCH_SPEC) {
         const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
-        const session = getSession(sessionId);
-        const sessionSpecUrl = normalizeSpecUrl(session.variables.specUrl);
+        getSession(sessionId);
         const specUrl =
           requestedSpecUrl ??
-          sessionSpecUrl ??
           defaultSpecUrl ??
           normalizeSpecUrl(getExplicitOpenApiSpecUrl());
         if (!specUrl) {
@@ -992,7 +988,7 @@ export async function createMcpServer(
                   {
                     ok: false,
                     error:
-                      "Missing OpenAPI URL. Set OPENAPI_SPEC_URL, set session.specUrl, or pass url.",
+                      "Missing OpenAPI URL. Set `?url=` on MCP endpoint, send `url` header, pass `url` argument, or set OPENAPI_SPEC_URL.",
                   },
                   null,
                   2,

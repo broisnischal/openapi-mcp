@@ -37,6 +37,7 @@ app.get("/", (c) => {
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.all("/mcp", async (c) => {
+  const querySpecUrl = c.req.query("url");
   const headerSpecUrl =
     c.req.header("url") ??
     c.req.header("x-openapi-url") ??
@@ -49,7 +50,7 @@ app.all("/mcp", async (c) => {
 
   const transport = new WebStandardStreamableHTTPServerTransport();
   const server = await createMcpServer({
-    defaultSpecUrl: headerSpecUrl,
+    defaultSpecUrl: querySpecUrl ?? headerSpecUrl,
     specFetchHeaders,
   });
   await server.connect(transport);

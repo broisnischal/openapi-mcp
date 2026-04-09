@@ -41,16 +41,16 @@ If the spec URL is temporarily unavailable (for example `502`), the MCP server s
 
 ### Set OpenAPI URL via request headers (recommended)
 
-You can provide spec configuration from MCP HTTP headers (instead of env). Use one simple header:
+You can provide spec configuration without session storage:
 
-- `url`: OpenAPI JSON URL to use as default for this request
+- `?url=` query param on MCP endpoint (recommended for static MCP config)
+- `url` header on MCP request
 - `authorization`: optional auth header used when fetching the spec URL
 
 Example:
 
 ```http
-POST /mcp
-url: api.example.com/openapi.json
+POST /mcp?url=api.example.com/openapi.json
 authorization: Bearer YOUR_TOKEN
 ```
 
@@ -62,10 +62,7 @@ Add an MCP server entry that points to this URL:
 {
   "mcpServers": {
     "openapi-hono": {
-      "url": "https://dx.lexicon.website/mcp",
-      "env": {
-        "OPENAPI_SPEC_URL": "https://ag.nischal-dahal.com.np/api-docs-json"
-      }
+      "url": "https://dx.lexicon.website/mcp?url=https://ag.nischal-dahal.com.np/api-docs-json"
     }
   }
 }
@@ -73,15 +70,15 @@ Add an MCP server entry that points to this URL:
 
 ### Where to set the OpenAPI spec URL
 
-You can set the spec URL in two ways:
+You can set the spec URL in three ways:
 
-1. **Server default (recommended):** set `OPENAPI_SPEC_URL` before starting server.
+1. **MCP URL query (recommended):** configure `.../mcp?url=...` in your MCP client.
 
 ```sh
-OPENAPI_SPEC_URL="https://your-api.com/openapi.json" npm run dev
+https://your-domain/mcp?url=https://your-api.com/openapi.json
 ```
 
-2. **Per request override:** pass `specUrl` in `api_search` or `api_execute` arguments.
+2. **Per request override:** pass `url` in `api_search` or `api_execute` arguments.
 
 ```json
 {
@@ -135,3 +132,5 @@ OPENAPI_SPEC_URL="https://your-api.com/openapi.json" npm run dev
   }
 }
 ```
+
+Note: only auth/token data is stored in `session`; OpenAPI URL is not read from session anymore.
