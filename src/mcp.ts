@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 import { mkdir, access, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
@@ -43,6 +43,8 @@ type OperationEntry = {
 
 type SessionState = {
   variables: Record<string, Json>;
+  authProfiles: Record<string, AuthProfile>;
+  activeAuthProfile?: string;
   lastResponse?: {
     status: number;
     url: string;
@@ -59,6 +61,19 @@ type ToolInput = {
   headers?: Record<string, string>;
   body?: Json;
   extractVariables?: Record<string, string>;
+  authProfile?: string;
+};
+
+type AuthProfile =
+  | { type: "bearer"; token: string; prefix?: string }
+  | { type: "basic"; username: string; password: string }
+  | { type: "apiKey"; in: "header" | "query"; key: string; value: string }
+  | { type: "oauthToken"; accessToken: string; tokenType?: string };
+
+type ExecuteExpectations = {
+  status?: number | number[];
+  headers?: Record<string, string>;
+  jsonPathEquals?: Record<string, Json | string | number | boolean | null>;
 };
 
 type SpecRuntime = {
@@ -70,15 +85,10 @@ type SpecRuntime = {
   byMethodPath: Map<string, OperationEntry>;
 };
 
-const DEFAULT_SPEC_URL = "https://ag.nischal-dahal.com.np/api-docs-json";
-const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-/** Default cache path when OPENAPI_SPEC_FILE is unset (project root openapi.json). */
-const DEFAULT_SPEC_CACHE_FILE = process.env.VERCEL
-  ? "/tmp/openapi.json"
-  : join(PROJECT_ROOT, "openapi.json");
-const OPENAPI_CACHE_DIR = process.env.VERCEL
-  ? "/tmp/openapi-cache"
-  : join(PROJECT_ROOT, ".openapi-cache");
+const USER_CACHE_ROOT = join(homedir(), ".openapi-mcp");
+/** Default cache path when OPENAPI_SPEC_FILE is unset (user home openapi.json). */
+const DEFAULT_SPEC_CACHE_FILE = join(USER_CACHE_ROOT, "openapi.json");
+const OPENAPI_CACHE_DIR = join(USER_CACHE_ROOT, "cache");
 const API_BASE_URL = process.env.API_BASE_URL;
 const DEFAULT_SESSION_ID = "default";
 
@@ -133,14 +143,181 @@ async function fileExists(filePath: string): Promise<boolean> {
 const TOOL_SEARCH = "api_search";
 const TOOL_EXECUTE = "api_execute";
 const TOOL_SESSION = "session";
+const TOOL_REFETCH_SPEC = "api_refetch_spec";
+const TOOL_PLAN_INTEGRATION = "api_plan_integration";
 
 const sessions = new Map<string, SessionState>();
 
 function getSession(sessionId: string): SessionState {
   if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, { variables: {} });
+    sessions.set(sessionId, { variables: {}, authProfiles: {} });
   }
   return sessions.get(sessionId)!;
+}
+
+function scoreNeedleInHaystack(needle: string, haystack: string): number {
+  const n = needle.trim().toLowerCase();
+  const h = haystack.toLowerCase();
+  if (!n || !h) return 0;
+  if (h === n) return 100;
+  if (h.startsWith(n)) return 90;
+  if (h.includes(n)) return 75;
+  const tokens = n.split(/\s+/).filter(Boolean);
+  let score = 0;
+  for (const t of tokens) {
+    if (h.includes(t)) score += 20;
+  }
+  return score;
+}
+
+function suggestOperations(
+  operations: OperationEntry[],
+  args: { operationId?: string; method?: string; path?: string },
+  limit: number,
+): Array<{ operationId: string; method: string; path: string; summary: string | null }> {
+  const needle = [args.operationId, args.method, args.path]
+    .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+    .join(" ")
+    .trim();
+  if (!needle) return [];
+  return operations
+    .map((op) => {
+      const haystack = `${op.operationId} ${op.method} ${op.path} ${op.summary ?? ""}`;
+      return { op, score: scoreNeedleInHaystack(needle, haystack) };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ op }) => ({
+      operationId: op.operationId,
+      method: op.method,
+      path: op.path,
+      summary: op.summary ?? null,
+    }));
+}
+
+function applyAuthProfile(
+  auth: AuthProfile | undefined,
+  headers: Record<string, string>,
+  url: URL,
+): void {
+  if (!auth) return;
+  if (auth.type === "bearer") {
+    const prefix = auth.prefix?.trim() || "Bearer";
+    headers.authorization = `${prefix} ${auth.token}`;
+    return;
+  }
+  if (auth.type === "oauthToken") {
+    const tokenType = auth.tokenType?.trim() || "Bearer";
+    headers.authorization = `${tokenType} ${auth.accessToken}`;
+    return;
+  }
+  if (auth.type === "basic") {
+    const encoded = Buffer.from(`${auth.username}:${auth.password}`).toString(
+      "base64",
+    );
+    headers.authorization = `Basic ${encoded}`;
+    return;
+  }
+  if (auth.type === "apiKey") {
+    if (auth.in === "header") {
+      headers[auth.key] = auth.value;
+    } else {
+      url.searchParams.set(auth.key, auth.value);
+    }
+  }
+}
+
+function normalizeAuthProfile(input: unknown): AuthProfile | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const obj = input as Record<string, unknown>;
+  const type = obj.type;
+  if (type === "bearer" && typeof obj.token === "string") {
+    return {
+      type,
+      token: obj.token,
+      prefix: typeof obj.prefix === "string" ? obj.prefix : undefined,
+    };
+  }
+  if (
+    type === "basic" &&
+    typeof obj.username === "string" &&
+    typeof obj.password === "string"
+  ) {
+    return { type, username: obj.username, password: obj.password };
+  }
+  if (
+    type === "apiKey" &&
+    (obj.in === "header" || obj.in === "query") &&
+    typeof obj.key === "string" &&
+    typeof obj.value === "string"
+  ) {
+    return { type, in: obj.in, key: obj.key, value: obj.value };
+  }
+  if (type === "oauthToken" && typeof obj.accessToken === "string") {
+    return {
+      type,
+      accessToken: obj.accessToken,
+      tokenType: typeof obj.tokenType === "string" ? obj.tokenType : undefined,
+    };
+  }
+  return undefined;
+}
+
+function evaluateAssertions(
+  result: { status: number; data: Json | string; headers?: Record<string, string> },
+  expect: ExecuteExpectations | undefined,
+) {
+  const checks: Array<{
+    type: "status" | "header" | "jsonPathEquals";
+    target: string;
+    expected: unknown;
+    actual: unknown;
+    passed: boolean;
+  }> = [];
+  if (!expect) return { passed: true, checks };
+
+  if (expect.status !== undefined) {
+    const expectedStatuses = Array.isArray(expect.status)
+      ? expect.status
+      : [expect.status];
+    const passed = expectedStatuses.includes(result.status);
+    checks.push({
+      type: "status",
+      target: "status",
+      expected: expectedStatuses,
+      actual: result.status,
+      passed,
+    });
+  }
+
+  if (expect.headers) {
+    for (const [headerName, expectedValue] of Object.entries(expect.headers)) {
+      const actual = result.headers?.[headerName.toLowerCase()] ?? null;
+      checks.push({
+        type: "header",
+        target: headerName,
+        expected: expectedValue,
+        actual,
+        passed: actual === expectedValue,
+      });
+    }
+  }
+
+  if (expect.jsonPathEquals) {
+    for (const [jsonPath, expectedValue] of Object.entries(expect.jsonPathEquals)) {
+      const actual = getByPath(result.data, jsonPath);
+      checks.push({
+        type: "jsonPathEquals",
+        target: jsonPath,
+        expected: expectedValue,
+        actual: actual ?? null,
+        passed: actual === expectedValue,
+      });
+    }
+  }
+
+  return { passed: checks.every((c) => c.passed), checks };
 }
 
 function interpolateVariables<T extends Json | string>(
@@ -261,7 +438,12 @@ function searchOperations(
 
 async function loadOpenApiSpec(): Promise<OpenApiSpec> {
   const specFile = resolveOpenApiSpecFilePath();
-  const specUrl = getExplicitOpenApiSpecUrl() ?? DEFAULT_SPEC_URL;
+  const specUrl = normalizeSpecUrl(getExplicitOpenApiSpecUrl());
+  if (!specUrl) {
+    throw new Error(
+      "Missing OPENAPI_SPEC_URL. Set it to a valid HTTP/HTTPS OpenAPI JSON endpoint.",
+    );
+  }
 
   if (isOpenApiOfflineMode()) {
     if (!(await fileExists(specFile))) {
@@ -347,6 +529,53 @@ async function loadSpecRuntime(
 function staticTools(): Tool[] {
   return [
     {
+      name: TOOL_PLAN_INTEGRATION,
+      description:
+        "Generate an API integration/testing plan from a goal using matched OpenAPI operations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          goal: {
+            type: "string",
+            description:
+              "Natural language goal, e.g. 'sign in then create order then verify status'.",
+          },
+          limit: {
+            type: "number",
+            description: "Maximum number of suggested steps (default 8).",
+          },
+          specUrl: {
+            type: "string",
+            description:
+              "Optional OpenAPI URL override for this request (HTTP/HTTPS).",
+          },
+          sessionId: { type: "string" },
+        },
+        required: ["goal"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: TOOL_REFETCH_SPEC,
+      description:
+        "Refetch OpenAPI JSON from a URL and persist it to local openapi.json cache on this machine.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          specUrl: {
+            type: "string",
+            description:
+              "OpenAPI URL override for this refetch request (HTTP/HTTPS).",
+          },
+          sessionId: {
+            type: "string",
+            description: "Optional session key where specUrl may be stored.",
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
       name: TOOL_SEARCH,
       description:
         "Search API operations by keywords (operationId, path, method, summary). Use before api_execute to find the right operationId.",
@@ -426,6 +655,33 @@ function staticTools(): Tool[] {
               'Map session variable -> JSON path e.g. { "token": "$.data.token" }',
             additionalProperties: { type: "string" },
           },
+          authProfile: {
+            type: "string",
+            description:
+              "Optional saved auth profile name from session action setAuthProfile/useAuthProfile.",
+          },
+          expect: {
+            type: "object",
+            description:
+              "Optional assertions for CI-like checks: status, headers, jsonPathEquals.",
+            properties: {
+              status: {
+                oneOf: [
+                  { type: "number" },
+                  { type: "array", items: { type: "number" } },
+                ],
+              },
+              headers: {
+                type: "object",
+                additionalProperties: { type: "string" },
+              },
+              jsonPathEquals: {
+                type: "object",
+                additionalProperties: true,
+              },
+            },
+            additionalProperties: false,
+          },
         },
         additionalProperties: false,
       },
@@ -439,7 +695,17 @@ function staticTools(): Tool[] {
         properties: {
           action: {
             type: "string",
-            enum: ["setVariables", "getVariables", "getLastResponse", "clear"],
+            enum: [
+              "setVariables",
+              "getVariables",
+              "getLastResponse",
+              "setAuthProfile",
+              "getAuthProfile",
+              "listAuthProfiles",
+              "useAuthProfile",
+              "clearAuthProfiles",
+              "clear",
+            ],
             description: "Which session operation to run",
           },
           sessionId: { type: "string" },
@@ -447,6 +713,16 @@ function staticTools(): Tool[] {
             type: "object",
             description:
               "For setVariables: key/value map to merge into session",
+            additionalProperties: true,
+          },
+          profileName: {
+            type: "string",
+            description: "Auth profile name for set/get/use actions.",
+          },
+          auth: {
+            type: "object",
+            description:
+              "Auth profile payload. Types: bearer, basic, apiKey, oauthToken.",
             additionalProperties: true,
           },
         },
@@ -545,6 +821,11 @@ async function runApiCall(
   if (!headers.authorization && typeof session.variables.token === "string") {
     headers.authorization = `Bearer ${session.variables.token}`;
   }
+  const authProfileName = args.authProfile ?? session.activeAuthProfile;
+  const authProfile = authProfileName
+    ? session.authProfiles[authProfileName]
+    : undefined;
+  applyAuthProfile(authProfile, headers, url);
 
   const requestInit: RequestInit = {
     method: op.method,
@@ -606,7 +887,14 @@ async function getSharedRuntimeState(): Promise<SharedRuntimeState> {
   sharedRuntimeStatePromise = (async () => {
     const runtimeCache = new Map<string, SpecRuntime>();
     try {
-      const specUrlForOrigin = getExplicitOpenApiSpecUrl() ?? DEFAULT_SPEC_URL;
+      const specUrlForOrigin = normalizeSpecUrl(getExplicitOpenApiSpecUrl());
+      if (!specUrlForOrigin) {
+        return {
+          runtimeCache,
+          initError:
+            "Missing OPENAPI_SPEC_URL. Set it to a valid HTTP/HTTPS OpenAPI JSON endpoint.",
+        };
+      }
       const specFile = resolveOpenApiSpecFilePath();
       const defaultSpec = await loadOpenApiSpec();
       const defaultOperations = collectOperations(defaultSpec);
@@ -662,6 +950,25 @@ export async function createMcpServer(): Promise<Server> {
     const name = request.params.name;
     const raw = (request.params.arguments ?? {}) as Record<string, unknown>;
     const requestedSpecUrl = normalizeSpecUrl(raw.specUrl);
+    if (raw.specUrl !== undefined && !requestedSpecUrl) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                error:
+                  "Invalid specUrl. Expected a valid HTTP/HTTPS URL to an OpenAPI JSON endpoint.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
 
     const runtimeFor = async (sessionId?: string): Promise<SpecRuntime> => {
       const session = getSession(sessionId ?? DEFAULT_SESSION_ID);
@@ -670,8 +977,12 @@ export async function createMcpServer(): Promise<Server> {
         requestedSpecUrl ??
         sessionSpecUrl ??
         runtimeState.defaultRuntime?.specUrl ??
-        normalizeSpecUrl(getExplicitOpenApiSpecUrl()) ??
-        DEFAULT_SPEC_URL;
+        normalizeSpecUrl(getExplicitOpenApiSpecUrl());
+      if (!specUrl) {
+        throw new Error(
+          "Missing OpenAPI URL. Provide specUrl in the tool call, set session.variables.specUrl, or set OPENAPI_SPEC_URL.",
+        );
+      }
       const cached = runtimeCache.get(specUrl);
       if (cached) return cached;
       const runtime = await loadSpecRuntime(
@@ -685,6 +996,64 @@ export async function createMcpServer(): Promise<Server> {
     };
 
     try {
+      if (name === TOOL_REFETCH_SPEC) {
+        const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
+        const session = getSession(sessionId);
+        const sessionSpecUrl = normalizeSpecUrl(session.variables.specUrl);
+        const specUrl =
+          requestedSpecUrl ??
+          sessionSpecUrl ??
+          normalizeSpecUrl(getExplicitOpenApiSpecUrl());
+        if (!specUrl) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    ok: false,
+                    error:
+                      "Missing OpenAPI URL. Set OPENAPI_SPEC_URL, set session.specUrl, or pass specUrl.",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        const runtime = await loadSpecRuntime(
+          specUrl,
+          specUrl === runtimeState.defaultRuntime?.specUrl
+            ? resolveOpenApiSpecFilePath()
+            : cacheFileForSpecUrl(specUrl),
+        );
+        runtimeCache.set(specUrl, runtime);
+        if (specUrl === runtimeState.defaultRuntime?.specUrl) {
+          runtimeState.defaultRuntime = runtime;
+        }
+        const savedSpecText = await readFile(runtime.specFile, "utf8");
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ok: true,
+                  specUrl: runtime.specUrl,
+                  savedTo: runtime.specFile,
+                  operationCount: runtime.operations.length,
+                  openapiJson: JSON.parse(savedSpecText) as Json,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
       if (name === TOOL_SEARCH) {
         const runtime = await runtimeFor(raw.sessionId as string | undefined);
         const query = String(raw.query ?? "");
@@ -714,7 +1083,44 @@ export async function createMcpServer(): Promise<Server> {
         };
       }
 
-    if (name === TOOL_SESSION) {
+      if (name === TOOL_PLAN_INTEGRATION) {
+        const runtime = await runtimeFor(raw.sessionId as string | undefined);
+        const goal = String(raw.goal ?? "").trim();
+        const limit = Math.min(20, Math.max(1, Number(raw.limit ?? 8) || 8));
+        const suggested = searchOperations(runtime.operations, goal, limit).map(
+          (op, index) => ({
+            step: index + 1,
+            operationId: op.operationId,
+            method: op.method,
+            path: op.path,
+            summary: op.summary ?? null,
+            why:
+              op.summary ??
+              `Matches goal keywords in ${op.method} ${op.path} / ${op.operationId}`,
+          }),
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ok: true,
+                  goal,
+                  specUrl: runtime.specUrl,
+                  suggestedSteps: suggested,
+                  usageHint:
+                    "Execute steps with api_execute. Use extractVariables + {{var}} between steps.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      if (name === TOOL_SESSION) {
       const action = raw.action as string;
       const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
       const session = getSession(sessionId);
@@ -762,8 +1168,140 @@ export async function createMcpServer(): Promise<Server> {
           ],
         };
       }
+      if (action === "setAuthProfile") {
+        const profileName = String(raw.profileName ?? "").trim();
+        const auth = normalizeAuthProfile(raw.auth);
+        if (!profileName || !auth) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    ok: false,
+                    error:
+                      "setAuthProfile requires profileName and valid auth payload (bearer/basic/apiKey/oauthToken).",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        session.authProfiles[profileName] = auth;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ok: true,
+                  sessionId,
+                  profileName,
+                  activeAuthProfile: session.activeAuthProfile ?? null,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      if (action === "getAuthProfile") {
+        const profileName = String(raw.profileName ?? "").trim();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sessionId,
+                  profileName: profileName || null,
+                  authProfile: profileName
+                    ? (session.authProfiles[profileName] ?? null)
+                    : null,
+                  activeAuthProfile: session.activeAuthProfile ?? null,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      if (action === "listAuthProfiles") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sessionId,
+                  activeAuthProfile: session.activeAuthProfile ?? null,
+                  profiles: Object.keys(session.authProfiles),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      if (action === "useAuthProfile") {
+        const profileName = String(raw.profileName ?? "").trim();
+        if (!profileName || !session.authProfiles[profileName]) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    ok: false,
+                    error: "Unknown auth profile. Use setAuthProfile first.",
+                    profileName: profileName || null,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        session.activeAuthProfile = profileName;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { ok: true, sessionId, activeAuthProfile: profileName },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      if (action === "clearAuthProfiles") {
+        session.authProfiles = {};
+        session.activeAuthProfile = undefined;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { ok: true, sessionId, clearedAuthProfiles: true },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
       if (action === "clear") {
-        sessions.set(sessionId, { variables: {} });
+        sessions.set(sessionId, { variables: {}, authProfiles: {} });
         return {
           content: [
             {
@@ -786,7 +1324,7 @@ export async function createMcpServer(): Promise<Server> {
           },
         ],
       };
-    }
+      }
 
       if (name === TOOL_EXECUTE) {
       const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
@@ -800,6 +1338,15 @@ export async function createMcpServer(): Promise<Server> {
       });
 
       if (!op) {
+        const suggestions = suggestOperations(
+          runtime.operations,
+          {
+            operationId: raw.operationId as string | undefined,
+            method: raw.method as string | undefined,
+            path: raw.path as string | undefined,
+          },
+          5,
+        );
         const hint =
           runtime.operations.length > 0
             ? " Use api_search with keywords from the path or summary."
@@ -809,7 +1356,16 @@ export async function createMcpServer(): Promise<Server> {
           content: [
             {
               type: "text",
-              text: `Unknown operation. Pass operationId from api_search, or method + path (OpenAPI template).${hint}`,
+              text: JSON.stringify(
+                {
+                  ok: false,
+                  error:
+                    `Unknown operation. Pass operationId from api_search, or method + path (OpenAPI template).${hint}`.trim(),
+                  didYouMean: suggestions,
+                },
+                null,
+                2,
+              ),
             },
           ],
         };
@@ -826,9 +1382,15 @@ export async function createMcpServer(): Promise<Server> {
         headers: raw.headers as ToolInput["headers"],
         body: raw.body as Json,
         extractVariables: raw.extractVariables as ToolInput["extractVariables"],
+        authProfile: raw.authProfile as string | undefined,
       };
+      const expect = (raw.expect ?? undefined) as ExecuteExpectations | undefined;
 
         const result = await runApiCall(op, toolArgs, session, runtime.baseUrl);
+        const assertions = evaluateAssertions(
+          { status: result.status, data: result.data, headers: session.lastResponse?.headers },
+          expect,
+        );
         return {
           content: [
             {
@@ -843,13 +1405,14 @@ export async function createMcpServer(): Promise<Server> {
                   url: result.url,
                   specUrl: runtime.specUrl,
                   data: result.data,
+                  assertions,
                 },
                 null,
                 2,
               ),
             },
           ],
-          isError: result.isError,
+          isError: result.isError || !assertions.passed,
         };
       }
     } catch (error) {
@@ -864,7 +1427,7 @@ export async function createMcpServer(): Promise<Server> {
                 ok: false,
                 error: message,
                 hint:
-                  "Set OPENAPI_SPEC_URL to a reachable JSON endpoint, or set OPENAPI_SPEC_OFFLINE=1 with OPENAPI_SPEC_FILE pointing to a local spec cache.",
+                  "Provide a valid specUrl (tool argument, session variable, or OPENAPI_SPEC_URL) and ensure it serves OpenAPI JSON over HTTP/HTTPS.",
                 startupError: runtimeState.initError ?? null,
               },
               null,
