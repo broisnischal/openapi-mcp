@@ -85,11 +85,19 @@ type SpecRuntime = {
   byMethodPath: Map<string, OperationEntry>;
 };
 
+type CreateMcpServerOptions = {
+  defaultSpecUrl?: string;
+  specFetchHeaders?: Record<string, string>;
+};
+
 const USER_CACHE_ROOT = join(homedir(), ".openapi-mcp");
 /** Default cache path when OPENAPI_SPEC_FILE is unset (user home openapi.json). */
 const DEFAULT_SPEC_CACHE_FILE = join(USER_CACHE_ROOT, "openapi.json");
 const OPENAPI_CACHE_DIR = join(USER_CACHE_ROOT, "cache");
 const API_BASE_URL = process.env.API_BASE_URL;
+const ENABLE_SERVER_FILE_CACHE =
+  process.env.OPENAPI_SERVER_FILE_CACHE?.trim().toLowerCase() === "1" ||
+  process.env.OPENAPI_SERVER_FILE_CACHE?.trim().toLowerCase() === "true";
 const DEFAULT_SESSION_ID = "default";
 
 function getExplicitOpenApiSpecUrl(): string | undefined {
@@ -112,8 +120,9 @@ function normalizeSpecUrl(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const v = value.trim();
   if (!v) return undefined;
+  const withProtocol = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(v) ? v : `https://${v}`;
   try {
-    const parsed = new URL(v);
+    const parsed = new URL(withProtocol);
     if (!["http:", "https:"].includes(parsed.protocol)) return undefined;
     return parsed.toString();
   } catch {
@@ -484,29 +493,33 @@ async function loadOpenApiSpec(): Promise<OpenApiSpec> {
 async function loadSpecRuntime(
   specUrl: string,
   specFile: string,
+  specFetchHeaders?: Record<string, string>,
 ): Promise<SpecRuntime> {
   const specResponse = await fetch(specUrl, {
     headers: {
       accept: "application/json, */*",
       "user-agent": "openapi-proxy-mcp/0.3.0",
+      ...(specFetchHeaders ?? {}),
     },
   });
 
   let spec: OpenApiSpec;
   if (specResponse.ok) {
     spec = (await specResponse.json()) as OpenApiSpec;
-    await ensureParentDirectory(specFile);
-    await writeFile(specFile, JSON.stringify(spec, null, 2), "utf8");
-    console.info(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
+    if (ENABLE_SERVER_FILE_CACHE) {
+      await ensureParentDirectory(specFile);
+      await writeFile(specFile, JSON.stringify(spec, null, 2), "utf8");
+      console.info(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
+    }
   } else {
-    if (await fileExists(specFile)) {
+    if (ENABLE_SERVER_FILE_CACHE && (await fileExists(specFile))) {
       console.warn(
         `OpenAPI fetch failed (${specResponse.status} ${specResponse.statusText}); using cached ${specFile}`,
       );
       spec = JSON.parse(await readFile(specFile, "utf8")) as OpenApiSpec;
     } else {
       throw new Error(
-        `Failed to load OpenAPI spec: ${specResponse.status} ${specResponse.statusText}. No cache at ${specFile}.`,
+        `Failed to load OpenAPI spec: ${specResponse.status} ${specResponse.statusText}.`,
       );
     }
   }
@@ -875,9 +888,7 @@ async function runApiCall(
 }
 
 type SharedRuntimeState = {
-  defaultRuntime?: SpecRuntime;
   runtimeCache: Map<string, SpecRuntime>;
-  initError?: string;
 };
 
 let sharedRuntimeStatePromise: Promise<SharedRuntimeState> | undefined;
@@ -885,51 +896,18 @@ let sharedRuntimeStatePromise: Promise<SharedRuntimeState> | undefined;
 async function getSharedRuntimeState(): Promise<SharedRuntimeState> {
   if (sharedRuntimeStatePromise) return sharedRuntimeStatePromise;
   sharedRuntimeStatePromise = (async () => {
-    const runtimeCache = new Map<string, SpecRuntime>();
-    try {
-      const specUrlForOrigin = normalizeSpecUrl(getExplicitOpenApiSpecUrl());
-      if (!specUrlForOrigin) {
-        return {
-          runtimeCache,
-          initError:
-            "Missing OPENAPI_SPEC_URL. Set it to a valid HTTP/HTTPS OpenAPI JSON endpoint.",
-        };
-      }
-      const specFile = resolveOpenApiSpecFilePath();
-      const defaultSpec = await loadOpenApiSpec();
-      const defaultOperations = collectOperations(defaultSpec);
-      const defaultMaps = buildOperationMaps(defaultOperations);
-      const defaultBaseUrl = (
-        API_BASE_URL ??
-        defaultSpec.servers?.[0]?.url ??
-        new URL(specUrlForOrigin).origin
-      ).replace(/\/$/, "");
-      const defaultRuntime: SpecRuntime = {
-        specUrl: specUrlForOrigin,
-        specFile,
-        baseUrl: defaultBaseUrl,
-        operations: defaultOperations,
-        byOperationId: defaultMaps.byOperationId,
-        byMethodPath: defaultMaps.byMethodPath,
-      };
-      runtimeCache.set(defaultRuntime.specUrl, defaultRuntime);
-      return { defaultRuntime, runtimeCache };
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Unknown startup error";
-      console.error(`OpenAPI startup load failed: ${message}`);
-      return {
-        runtimeCache,
-        initError: message,
-      };
-    }
+    return { runtimeCache: new Map<string, SpecRuntime>() };
   })();
   return sharedRuntimeStatePromise;
 }
 
-export async function createMcpServer(): Promise<Server> {
+export async function createMcpServer(
+  options: CreateMcpServerOptions = {},
+): Promise<Server> {
   const runtimeState = await getSharedRuntimeState();
   const { runtimeCache } = runtimeState;
+  const defaultSpecUrl = normalizeSpecUrl(options.defaultSpecUrl);
+  const specFetchHeaders = options.specFetchHeaders ?? {};
   const server = new Server(
     {
       name: "openapi-proxy-mcp",
@@ -949,8 +927,8 @@ export async function createMcpServer(): Promise<Server> {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const name = request.params.name;
     const raw = (request.params.arguments ?? {}) as Record<string, unknown>;
-    const requestedSpecUrl = normalizeSpecUrl(raw.specUrl);
-    if (raw.specUrl !== undefined && !requestedSpecUrl) {
+    const requestedSpecUrl = normalizeSpecUrl(raw.url ?? raw.specUrl);
+    if ((raw.url !== undefined || raw.specUrl !== undefined) && !requestedSpecUrl) {
       return {
         isError: true,
         content: [
@@ -960,7 +938,7 @@ export async function createMcpServer(): Promise<Server> {
               {
                 ok: false,
                 error:
-                  "Invalid specUrl. Expected a valid HTTP/HTTPS URL to an OpenAPI JSON endpoint.",
+                  "Invalid url. Expected a valid OpenAPI URL (http/https). You can also pass host-only values like api.example.com/openapi.json.",
               },
               null,
               2,
@@ -976,20 +954,19 @@ export async function createMcpServer(): Promise<Server> {
       const specUrl =
         requestedSpecUrl ??
         sessionSpecUrl ??
-        runtimeState.defaultRuntime?.specUrl ??
+        defaultSpecUrl ??
         normalizeSpecUrl(getExplicitOpenApiSpecUrl());
       if (!specUrl) {
         throw new Error(
-          "Missing OpenAPI URL. Provide specUrl in the tool call, set session.variables.specUrl, or set OPENAPI_SPEC_URL.",
+          "Missing OpenAPI URL. Provide `url` in the tool call, set session.variables.specUrl, or set OPENAPI_SPEC_URL.",
         );
       }
       const cached = runtimeCache.get(specUrl);
       if (cached) return cached;
       const runtime = await loadSpecRuntime(
         specUrl,
-        specUrl === runtimeState.defaultRuntime?.specUrl
-          ? resolveOpenApiSpecFilePath()
-          : cacheFileForSpecUrl(specUrl),
+        cacheFileForSpecUrl(specUrl),
+        specFetchHeaders,
       );
       runtimeCache.set(specUrl, runtime);
       return runtime;
@@ -1003,6 +980,7 @@ export async function createMcpServer(): Promise<Server> {
         const specUrl =
           requestedSpecUrl ??
           sessionSpecUrl ??
+          defaultSpecUrl ??
           normalizeSpecUrl(getExplicitOpenApiSpecUrl());
         if (!specUrl) {
           return {
@@ -1014,7 +992,7 @@ export async function createMcpServer(): Promise<Server> {
                   {
                     ok: false,
                     error:
-                      "Missing OpenAPI URL. Set OPENAPI_SPEC_URL, set session.specUrl, or pass specUrl.",
+                      "Missing OpenAPI URL. Set OPENAPI_SPEC_URL, set session.specUrl, or pass url.",
                   },
                   null,
                   2,
@@ -1025,15 +1003,10 @@ export async function createMcpServer(): Promise<Server> {
         }
         const runtime = await loadSpecRuntime(
           specUrl,
-          specUrl === runtimeState.defaultRuntime?.specUrl
-            ? resolveOpenApiSpecFilePath()
-            : cacheFileForSpecUrl(specUrl),
+          cacheFileForSpecUrl(specUrl),
+          specFetchHeaders,
         );
         runtimeCache.set(specUrl, runtime);
-        if (specUrl === runtimeState.defaultRuntime?.specUrl) {
-          runtimeState.defaultRuntime = runtime;
-        }
-        const savedSpecText = await readFile(runtime.specFile, "utf8");
         return {
           content: [
             {
@@ -1042,9 +1015,8 @@ export async function createMcpServer(): Promise<Server> {
                 {
                   ok: true,
                   specUrl: runtime.specUrl,
-                  savedTo: runtime.specFile,
+                  cacheMode: ENABLE_SERVER_FILE_CACHE ? "server-file" : "memory-only",
                   operationCount: runtime.operations.length,
-                  openapiJson: JSON.parse(savedSpecText) as Json,
                 },
                 null,
                 2,
@@ -1427,8 +1399,7 @@ export async function createMcpServer(): Promise<Server> {
                 ok: false,
                 error: message,
                 hint:
-                  "Provide a valid specUrl (tool argument, session variable, or OPENAPI_SPEC_URL) and ensure it serves OpenAPI JSON over HTTP/HTTPS.",
-                startupError: runtimeState.initError ?? null,
+                  "Provide a valid url (tool argument/header/session/env) and ensure it serves OpenAPI JSON over HTTP/HTTPS.",
               },
               null,
               2,

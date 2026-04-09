@@ -16,6 +16,10 @@ app.use(
       "mcp-session-id",
       "Last-Event-ID",
       "mcp-protocol-version",
+      "url",
+      "x-openapi-url",
+      "x-openapi-spec-url",
+      "authorization",
     ],
     exposeHeaders: ["mcp-session-id", "mcp-protocol-version"],
   }),
@@ -33,8 +37,21 @@ app.get("/", (c) => {
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.all("/mcp", async (c) => {
+  const headerSpecUrl =
+    c.req.header("url") ??
+    c.req.header("x-openapi-url") ??
+    c.req.header("x-openapi-spec-url");
+  const headerAuth = c.req.header("authorization");
+  const specFetchHeaders: Record<string, string> = {};
+  if (headerAuth) {
+    specFetchHeaders.authorization = headerAuth;
+  }
+
   const transport = new WebStandardStreamableHTTPServerTransport();
-  const server = await createMcpServer();
+  const server = await createMcpServer({
+    defaultSpecUrl: headerSpecUrl,
+    specFetchHeaders,
+  });
   await server.connect(transport);
   return transport.handleRequest(c.req.raw);
 });

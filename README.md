@@ -33,12 +33,26 @@ Server endpoints:
 ## Configure environment (optional)
 
 - `OPENAPI_SPEC_URL`: OpenAPI JSON URL (default: `https://ag.nischal-dahal.com.np/api-docs-json`)
-- `OPENAPI_SPEC_FILE`: path to cached OpenAPI file
-- `OPENAPI_SPEC_OFFLINE=1`: force offline mode and only use cached file
+- `OPENAPI_SERVER_FILE_CACHE=1`: optional, enable server-side file cache (disabled by default)
 - `API_BASE_URL`: override API base URL used for execution
 - `PORT`: HTTP server port (default `3000`)
 
-If the spec URL is temporarily unavailable (for example `502`), the MCP server now stays alive and returns a structured tool error with recovery hints instead of crashing.
+If the spec URL is temporarily unavailable (for example `502`), the MCP server stays alive and returns a structured tool error with recovery hints instead of crashing.
+
+### Set OpenAPI URL via request headers (recommended)
+
+You can provide spec configuration from MCP HTTP headers (instead of env). Use one simple header:
+
+- `url`: OpenAPI JSON URL to use as default for this request
+- `authorization`: optional auth header used when fetching the spec URL
+
+Example:
+
+```http
+POST /mcp
+url: api.example.com/openapi.json
+authorization: Bearer YOUR_TOKEN
+```
 
 ## Use with an MCP client
 
@@ -74,7 +88,7 @@ OPENAPI_SPEC_URL="https://your-api.com/openapi.json" npm run dev
   "name": "api_search",
   "arguments": {
     "query": "users list",
-    "specUrl": "https://your-api.com/openapi.json"
+    "url": "api.example.com/openapi.json"
   }
 }
 ```
