@@ -283,12 +283,12 @@ async function loadOpenApiSpec(): Promise<OpenApiSpec> {
     const spec = (await specResponse.json()) as OpenApiSpec;
     await ensureParentDirectory(specFile);
     await writeFile(specFile, JSON.stringify(spec, null, 2), "utf8");
-    console.error(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
+    console.info(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
     return spec;
   }
 
   if (await fileExists(specFile)) {
-    console.error(
+    console.warn(
       `OpenAPI fetch failed (${specResponse.status} ${specResponse.statusText}); using cached ${specFile}`,
     );
     return JSON.parse(await readFile(specFile, "utf8")) as OpenApiSpec;
@@ -315,10 +315,10 @@ async function loadSpecRuntime(
     spec = (await specResponse.json()) as OpenApiSpec;
     await ensureParentDirectory(specFile);
     await writeFile(specFile, JSON.stringify(spec, null, 2), "utf8");
-    console.error(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
+    console.info(`Synced OpenAPI spec from ${specUrl} -> ${specFile}`);
   } else {
     if (await fileExists(specFile)) {
-      console.error(
+      console.warn(
         `OpenAPI fetch failed (${specResponse.status} ${specResponse.statusText}); using cached ${specFile}`,
       );
       spec = JSON.parse(await readFile(specFile, "utf8")) as OpenApiSpec;
