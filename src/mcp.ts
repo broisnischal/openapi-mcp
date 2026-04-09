@@ -3,6 +3,7 @@ import { mkdir, access, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { z } from "zod";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -154,6 +155,89 @@ const TOOL_EXECUTE = "api_execute";
 const TOOL_SESSION = "session";
 const TOOL_REFETCH_SPEC = "api_refetch_spec";
 const TOOL_PLAN_INTEGRATION = "api_plan_integration";
+
+const UrlOverrideSchema = z.object({
+  url: z.string().optional(),
+  specUrl: z.string().optional(),
+});
+
+const PlanIntegrationInputSchema = UrlOverrideSchema.extend({
+  goal: z.string(),
+  limit: z.number().optional(),
+  sessionId: z.string().optional(),
+}).strict();
+
+const RefetchSpecInputSchema = UrlOverrideSchema.extend({
+  sessionId: z.string().optional(),
+}).strict();
+
+const SearchInputSchema = UrlOverrideSchema.extend({
+  query: z.string(),
+  limit: z.number().optional(),
+  sessionId: z.string().optional(),
+}).strict();
+
+const ExecuteInputSchema = UrlOverrideSchema.extend({
+  operationId: z.string().optional(),
+  method: z.string().optional(),
+  path: z.string().optional(),
+  sessionId: z.string().optional(),
+  pathParams: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
+  query: z
+    .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
+    .optional(),
+  headers: z.record(z.string(), z.string()).optional(),
+  body: z
+    .union([
+      z.record(z.string(), z.unknown()),
+      z.array(z.unknown()),
+      z.string(),
+      z.number(),
+      z.boolean(),
+      z.null(),
+    ])
+    .optional(),
+  extractVariables: z.record(z.string(), z.string()).optional(),
+  authProfile: z.string().optional(),
+  expect: z
+    .object({
+      status: z.union([z.number(), z.array(z.number())]).optional(),
+      headers: z.record(z.string(), z.string()).optional(),
+      jsonPathEquals: z.record(z.string(), z.unknown()).optional(),
+    })
+    .strict()
+    .optional(),
+}).strict();
+
+const SessionInputSchema = z
+  .object({
+    action: z.enum([
+      "setVariables",
+      "getVariables",
+      "getLastResponse",
+      "setAuthProfile",
+      "getAuthProfile",
+      "listAuthProfiles",
+      "useAuthProfile",
+      "clearAuthProfiles",
+      "clear",
+    ]),
+    sessionId: z.string().optional(),
+    variables: z.record(z.string(), z.unknown()).optional(),
+    profileName: z.string().optional(),
+    auth: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+
+function schemaForTool(schema: z.ZodTypeAny): Tool["inputSchema"] {
+  return z.toJSONSchema(schema) as Tool["inputSchema"];
+}
+
+function formatZodError(error: z.ZodError): string {
+  return error.issues
+    .map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+    .join("; ");
+}
 
 const sessions = new Map<string, SessionState>();
 
@@ -545,203 +629,31 @@ function staticTools(): Tool[] {
       name: TOOL_PLAN_INTEGRATION,
       description:
         "Generate an API integration/testing plan from a goal using matched OpenAPI operations.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          goal: {
-            type: "string",
-            description:
-              "Natural language goal, e.g. 'sign in then create order then verify status'.",
-          },
-          limit: {
-            type: "number",
-            description: "Maximum number of suggested steps (default 8).",
-          },
-          specUrl: {
-            type: "string",
-            description:
-              "Optional OpenAPI URL override for this request (HTTP/HTTPS).",
-          },
-          sessionId: { type: "string" },
-        },
-        required: ["goal"],
-        additionalProperties: false,
-      },
+      inputSchema: schemaForTool(PlanIntegrationInputSchema),
     },
     {
       name: TOOL_REFETCH_SPEC,
       description:
         "Refetch OpenAPI JSON from a URL and persist it to local openapi.json cache on this machine.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          specUrl: {
-            type: "string",
-            description:
-              "OpenAPI URL override for this refetch request (HTTP/HTTPS).",
-          },
-          sessionId: {
-            type: "string",
-            description: "Optional session key where specUrl may be stored.",
-          },
-        },
-        additionalProperties: false,
-      },
+      inputSchema: schemaForTool(RefetchSpecInputSchema),
     },
     {
       name: TOOL_SEARCH,
       description:
         "Search API operations by keywords (operationId, path, method, summary). Use before api_execute to find the right operationId.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "Space-separated keywords to match against operations",
-          },
-          limit: {
-            type: "number",
-            description: "Max results (default 25)",
-          },
-          specUrl: {
-            type: "string",
-            description:
-              "Optional OpenAPI URL override for this request (HTTP/HTTPS).",
-          },
-        },
-        required: ["query"],
-        additionalProperties: false,
-      },
+      inputSchema: schemaForTool(SearchInputSchema),
     },
     {
       name: TOOL_EXECUTE,
       description:
         "Call one API operation by operationId (from api_search) or by exact method + path. Supports path/query/body, session variables {{var}}, and extractVariables from JSON responses.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          operationId: {
-            type: "string",
-            description: "OpenAPI operationId from api_search",
-          },
-          specUrl: {
-            type: "string",
-            description:
-              "Optional OpenAPI URL override for this request (HTTP/HTTPS).",
-          },
-          method: {
-            type: "string",
-            description:
-              "HTTP method if resolving by path instead of operationId",
-          },
-          path: {
-            type: "string",
-            description:
-              "OpenAPI path template e.g. /api/v1/users/{id} (use with method)",
-          },
-          sessionId: {
-            type: "string",
-            description: "Session key for token and variable memory",
-          },
-          pathParams: {
-            type: "object",
-            description: "Values for {path} placeholders",
-            additionalProperties: true,
-          },
-          query: {
-            type: "object",
-            description: "Query string parameters",
-            additionalProperties: true,
-          },
-          headers: {
-            type: "object",
-            description: "Extra request headers",
-            additionalProperties: { type: "string" },
-          },
-          body: {
-            type: ["object", "array", "string", "number", "boolean", "null"],
-            description: "JSON request body (for non-GET)",
-          },
-          extractVariables: {
-            type: "object",
-            description:
-              'Map session variable -> JSON path e.g. { "token": "$.data.token" }',
-            additionalProperties: { type: "string" },
-          },
-          authProfile: {
-            type: "string",
-            description:
-              "Optional saved auth profile name from session action setAuthProfile/useAuthProfile.",
-          },
-          expect: {
-            type: "object",
-            description:
-              "Optional assertions for CI-like checks: status, headers, jsonPathEquals.",
-            properties: {
-              status: {
-                oneOf: [
-                  { type: "number" },
-                  { type: "array", items: { type: "number" } },
-                ],
-              },
-              headers: {
-                type: "object",
-                additionalProperties: { type: "string" },
-              },
-              jsonPathEquals: {
-                type: "object",
-                additionalProperties: true,
-              },
-            },
-            additionalProperties: false,
-          },
-        },
-        additionalProperties: false,
-      },
+      inputSchema: schemaForTool(ExecuteInputSchema),
     },
     {
       name: TOOL_SESSION,
       description:
         'Session memory: setVariables | getVariables | getLastResponse | clear (optional sessionId, default "default").',
-      inputSchema: {
-        type: "object",
-        properties: {
-          action: {
-            type: "string",
-            enum: [
-              "setVariables",
-              "getVariables",
-              "getLastResponse",
-              "setAuthProfile",
-              "getAuthProfile",
-              "listAuthProfiles",
-              "useAuthProfile",
-              "clearAuthProfiles",
-              "clear",
-            ],
-            description: "Which session operation to run",
-          },
-          sessionId: { type: "string" },
-          variables: {
-            type: "object",
-            description:
-              "For setVariables: key/value map to merge into session",
-            additionalProperties: true,
-          },
-          profileName: {
-            type: "string",
-            description: "Auth profile name for set/get/use actions.",
-          },
-          auth: {
-            type: "object",
-            description:
-              "Auth profile payload. Types: bearer, basic, apiKey, oauthToken.",
-            additionalProperties: true,
-          },
-        },
-        required: ["action"],
-        additionalProperties: false,
-      },
+      inputSchema: schemaForTool(SessionInputSchema),
     },
   ];
 }
@@ -972,7 +884,24 @@ export async function createMcpServer(
 
     try {
       if (name === TOOL_REFETCH_SPEC) {
-        const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
+        const parsed = RefetchSpecInputSchema.safeParse(raw);
+        if (!parsed.success) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { ok: false, error: `Invalid input: ${formatZodError(parsed.error)}` },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        const args = parsed.data;
+        const sessionId = args.sessionId ?? DEFAULT_SESSION_ID;
         getSession(sessionId);
         const specUrl =
           requestedSpecUrl ??
@@ -1023,9 +952,26 @@ export async function createMcpServer(
       }
 
       if (name === TOOL_SEARCH) {
-        const runtime = await runtimeFor(raw.sessionId as string | undefined);
-        const query = String(raw.query ?? "");
-        const limit = Math.min(100, Math.max(1, Number(raw.limit ?? 25) || 25));
+        const parsed = SearchInputSchema.safeParse(raw);
+        if (!parsed.success) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { ok: false, error: `Invalid input: ${formatZodError(parsed.error)}` },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        const args = parsed.data;
+        const runtime = await runtimeFor(args.sessionId);
+        const query = args.query;
+        const limit = Math.min(100, Math.max(1, Number(args.limit ?? 25) || 25));
         const hits = searchOperations(runtime.operations, query, limit);
         const payload = hits.map((op) => ({
           operationId: op.operationId,
@@ -1052,9 +998,26 @@ export async function createMcpServer(
       }
 
       if (name === TOOL_PLAN_INTEGRATION) {
-        const runtime = await runtimeFor(raw.sessionId as string | undefined);
-        const goal = String(raw.goal ?? "").trim();
-        const limit = Math.min(20, Math.max(1, Number(raw.limit ?? 8) || 8));
+        const parsed = PlanIntegrationInputSchema.safeParse(raw);
+        if (!parsed.success) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { ok: false, error: `Invalid input: ${formatZodError(parsed.error)}` },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        const args = parsed.data;
+        const runtime = await runtimeFor(args.sessionId);
+        const goal = args.goal.trim();
+        const limit = Math.min(20, Math.max(1, Number(args.limit ?? 8) || 8));
         const suggested = searchOperations(runtime.operations, goal, limit).map(
           (op, index) => ({
             step: index + 1,
@@ -1089,12 +1052,29 @@ export async function createMcpServer(
       }
 
       if (name === TOOL_SESSION) {
-      const action = raw.action as string;
-      const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
+      const parsed = SessionInputSchema.safeParse(raw);
+      if (!parsed.success) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { ok: false, error: `Invalid input: ${formatZodError(parsed.error)}` },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      const args = parsed.data;
+      const action = args.action;
+      const sessionId = args.sessionId ?? DEFAULT_SESSION_ID;
       const session = getSession(sessionId);
 
       if (action === "setVariables") {
-        const vars = (raw.variables ?? {}) as Record<string, Json>;
+        const vars = (args.variables ?? {}) as Record<string, Json>;
         session.variables = { ...session.variables, ...vars };
         return {
           content: [
@@ -1137,8 +1117,8 @@ export async function createMcpServer(
         };
       }
       if (action === "setAuthProfile") {
-        const profileName = String(raw.profileName ?? "").trim();
-        const auth = normalizeAuthProfile(raw.auth);
+        const profileName = String(args.profileName ?? "").trim();
+        const auth = normalizeAuthProfile(args.auth);
         if (!profileName || !auth) {
           return {
             isError: true,
@@ -1178,7 +1158,7 @@ export async function createMcpServer(
         };
       }
       if (action === "getAuthProfile") {
-        const profileName = String(raw.profileName ?? "").trim();
+        const profileName = String(args.profileName ?? "").trim();
         return {
           content: [
             {
@@ -1218,7 +1198,7 @@ export async function createMcpServer(
         };
       }
       if (action === "useAuthProfile") {
-        const profileName = String(raw.profileName ?? "").trim();
+        const profileName = String(args.profileName ?? "").trim();
         if (!profileName || !session.authProfiles[profileName]) {
           return {
             isError: true,
@@ -1295,23 +1275,40 @@ export async function createMcpServer(
       }
 
       if (name === TOOL_EXECUTE) {
-      const sessionId = (raw.sessionId as string) ?? DEFAULT_SESSION_ID;
+      const parsed = ExecuteInputSchema.safeParse(raw);
+      if (!parsed.success) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { ok: false, error: `Invalid input: ${formatZodError(parsed.error)}` },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      const args = parsed.data;
+      const sessionId = args.sessionId ?? DEFAULT_SESSION_ID;
       const session = getSession(sessionId);
       const runtime = await runtimeFor(sessionId);
 
       const op = resolveOperation(runtime.byOperationId, runtime.byMethodPath, {
-        operationId: raw.operationId as string | undefined,
-        method: raw.method as string | undefined,
-        path: raw.path as string | undefined,
+        operationId: args.operationId,
+        method: args.method,
+        path: args.path,
       });
 
       if (!op) {
         const suggestions = suggestOperations(
           runtime.operations,
           {
-            operationId: raw.operationId as string | undefined,
-            method: raw.method as string | undefined,
-            path: raw.path as string | undefined,
+            operationId: args.operationId,
+            method: args.method,
+            path: args.path,
           },
           5,
         );
@@ -1339,20 +1336,20 @@ export async function createMcpServer(
         };
       }
 
-      const pathParams = (raw.pathParams ?? {}) as Record<
+      const pathParams = (args.pathParams ?? {}) as Record<
         string,
         string | number
       >;
       const toolArgs: ToolInput = {
         sessionId,
         path: pathParams,
-        query: raw.query as ToolInput["query"],
-        headers: raw.headers as ToolInput["headers"],
-        body: raw.body as Json,
-        extractVariables: raw.extractVariables as ToolInput["extractVariables"],
-        authProfile: raw.authProfile as string | undefined,
+        query: args.query as ToolInput["query"],
+        headers: args.headers as ToolInput["headers"],
+        body: args.body as Json,
+        extractVariables: args.extractVariables as ToolInput["extractVariables"],
+        authProfile: args.authProfile,
       };
-      const expect = (raw.expect ?? undefined) as ExecuteExpectations | undefined;
+      const expect = (args.expect ?? undefined) as ExecuteExpectations | undefined;
 
         const result = await runApiCall(op, toolArgs, session, runtime.baseUrl);
         const assertions = evaluateAssertions(
